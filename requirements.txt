@@ -1,0 +1,42 @@
+# Core async
+requests>=2.31.0
+websockets==12.0
+aiohttp==3.9.5
+httpx==0.27.0
+
+# Polymarket SDK
+py-clob-client==0.34.5
+
+# Data
+polars==0.20.31
+pandas==2.2.2
+numpy==1.26.4
+
+# Config
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.3.0
+
+# Web dashboard
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Terminal display (keep for fallback)
+rich==13.7.1
+
+# Logging
+loguru==0.7.2
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
+aiohttp
+fastapi
+httpx
+loguru
+pydantic
+pydantic-settings
+python-dotenv
+requests
+uvicorn
+websockets
