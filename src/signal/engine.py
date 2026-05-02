@@ -2,11 +2,14 @@
 src/signal/engine.py
 Multi-asset signal engine — evaluates ALL active 5-min markets.
 
-Key philosophy:
-  - Only buy UNDERPRICED tokens (market thinks <55% chance, we disagree)
-  - Prefer low-priced tokens: buy at 0.30 → win pays 233%, buy at 0.55 → win pays 82%
-  - Entry allowed ANY TIME in the window with valid velocity + edge
-  - Rank by Expected Value (EV): edge × confidence × payout_multiplier
+תיקונים עיקריים לעומת הגרסה הקודמת:
+  1. DELTA_TO_WIN_PROB — הוספת הערה שזו טבלה שצריך לאמת empirically
+  2. הסרת time_bonus (לא מוסבר, מגדיל win_prob חינם)
+  3. direction_consistent bonus הופחת מ-6% ל-3% (שמרני יותר)
+  4. threshold לעסקה הוחמר: win_prob > token_price + 0.10 (היה 0.08)
+  5. הוספת velocity_sanity_check — דוחה spikes רועשים מדי
+  6. הוספת max_win_prob_cap — לא מעל 0.88 (היה 0.95, לא ריאלי)
+  7. הוסף לוג מפורט על כל asset שנדחה ומדוע
 """
 
 import time
@@ -19,34 +22,57 @@ from src.data.polymarket_feed import MultiMarketFeed
 from config.settings import Settings
 
 
-# Calibrated delta → win probability table
+# ─── טבלת delta → win probability ────────────────────────────────────────────
+#
+# ⚠️  חשוב: הטבלה הזו היא ESTIMATE בלבד!
+#     היא מבוססת על ההנחה שתנועה חדה ב-20s מנבאת את כיוון הסגירה.
+#     לאמת empirically: הרץ backtesting על נתוני Binance היסטוריים:
+#       לכל 5-min window, בדוק: האם delta_20s > X% חזה נכון את סיום החלון?
+#     עד שתאמת — השתמש בטבלה הזו בזהירות עם הון קטן.
+#
+# מה שיודעים:
+#   - delta קטן (<0.02%) = שוק רועש, לא אמין
+#   - delta גדול (>0.20%) = נדיר מאוד, עלול להיות spike שמתהפך
+#   - הטווח הטוב: 0.03%-0.10%
+#
 DELTA_TO_WIN_PROB = [
-    (0.01, 0.52),
-    (0.02, 0.55),
-    (0.03, 0.58),
-    (0.05, 0.63),
-    (0.07, 0.69),
-    (0.10, 0.75),
-    (0.15, 0.83),
-    (0.20, 0.89),
-    (0.30, 0.94),
+    (0.01, 0.51),  # delta 0.01% → 51% — כמעט כלום
+    (0.02, 0.53),  # delta 0.02% → 53%
+    (0.03, 0.56),  # delta 0.03% → 56%
+    (0.05, 0.61),  # delta 0.05% → 61%
+    (0.07, 0.66),  # delta 0.07% → 66%
+    (0.10, 0.71),  # delta 0.10% → 71%
+    (0.15, 0.76),  # delta 0.15% → 76%  ← הפחתה מ-83% לשמרנות
+    (0.20, 0.80),  # delta 0.20% → 80%  ← הפחתה מ-89%
+    (0.30, 0.84),  # delta 0.30% → 84%  ← הפחתה מ-94% — spike עלול להתהפך
 ]
 
+# רמת סיכון נוספת לפי נכס (נכסים volatile יותר = פחות ניתן לחזות)
 ASSET_VOLATILITY = {
-    "BTC":  1.0,
-    "ETH":  1.1,
-    "SOL":  1.3,
-    "XRP":  1.2,
-    "MATIC": 1.25,
-    "DOGE": 1.3,
-    "LINK": 1.15,
-    "AVAX": 1.2,
+    "BTC": 1.0,  # benchmark
+    "ETH": 1.1,
+    "SOL": 1.4,  # volatile מאוד
+    "XRP": 1.3,
+    "MATIC": 1.35,
+    "DOGE": 1.45,  # הכי volatile — קשה לחזות
+    "LINK": 1.2,
+    "AVAX": 1.25,
 }
+
+# ── גבולות סיכון ──────────────────────────────────────────────────────────────
+MAX_WIN_PROB = 0.88  # לא להאמין ל-95%+ — לא ריאלי בshort-term
+MIN_EDGE_HARD = 0.03  # עוגן — edge מינימלי אבסולוטי
+EDGE_OVER_MARKET = 0.10  # win_prob חייבת להיות לפחות 10% מעל מחיר הטוקן
+MAX_SPIKE_FILTER = 0.50  # delta מעל 0.5% = spike חשוד, לא edge
 
 
 def estimate_win_probability(delta_abs: float, asset: str = "BTC") -> float:
+    """
+    ממפה delta% → הסתברות ניצחון, מותאמת לvolatility של הנכס.
+    נכס volatile יותר → אותו delta = פחות ודאות.
+    """
     vol = ASSET_VOLATILITY.get(asset, 1.0)
-    adj = delta_abs / vol
+    adj = delta_abs / vol  # נרמל ל-BTC
 
     if adj <= DELTA_TO_WIN_PROB[0][0]:
         return DELTA_TO_WIN_PROB[0][1]
@@ -60,24 +86,22 @@ def estimate_win_probability(delta_abs: float, asset: str = "BTC") -> float:
             t = (adj - d0) / (d1 - d0)
             return p0 + t * (p1 - p0)
 
-    return 0.5
+    return 0.50
 
 
 def payout_multiplier(token_price: float) -> float:
     """
-    Returns the payout ratio of a winning trade.
-    token at 0.30 → win pays 233% (multiplier 3.33)
-    token at 0.50 → win pays 100% (multiplier 2.0)
-    token at 0.55 → win pays 82%  (multiplier 1.82)
+    כמה מכפיל הרווח אם נצח.
+    token=0.30 → מכפיל 3.33 (רווח 233%)
+    token=0.50 → מכפיל 2.0  (רווח 100%)
     """
     return 1.0 / token_price if token_price > 0 else 1.0
 
 
 class SignalEngine:
     """
-    Evaluates all active markets every second.
-    Prefers low-priced tokens for high payout ratios.
-    Entry allowed at any time when conditions are met.
+    סורק את כל השווקים הפעילים כל שנייה.
+    מעדיף טוקנים זולים (payout גבוה) עם edge ברור.
     """
 
     def __init__(
@@ -91,6 +115,7 @@ class SignalEngine:
         self._settings = settings
         self._traded_windows: Dict[str, int] = {}
         self._last_trade_time: Dict[str, float] = {}
+        self._skip_count: Dict[str, int] = {}  # לדיבוג — כמה פעמים נדחה כל asset
 
     def mark_traded(self, asset: str, window_ts: int) -> None:
         key = f"{asset}:{window_ts}"
@@ -116,17 +141,19 @@ class SignalEngine:
         if not candidates:
             return None
 
-        # Rank by: edge × confidence × payout_multiplier
-        # This means: prefer high-edge, high-confidence, HIGH-PAYOUT (low token price) trades
+        # דרוג: edge × confidence × payout_multiplier
+        # = עדיפות לעסקאות עם edge גבוה, סיכוי גבוה, ותשלום גבוה
         candidates.sort(
-            key=lambda s: s.edge_after_fees * s.confidence * payout_multiplier(s.token_price),
+            key=lambda s: s.edge_after_fees
+            * s.confidence
+            * payout_multiplier(s.token_price),
             reverse=True,
         )
         best = candidates[0]
 
         payout_pct = (payout_multiplier(best.token_price) - 1.0) * 100
         logger.success(
-            f"SIGNAL → {best.asset} {best.side} | "
+            f"✦ SIGNAL → {best.asset} {best.side} | "
             f"token={best.token_price:.3f} | payout=+{payout_pct:.0f}% | "
             f"edge={best.edge_after_fees:.3f} | conf={best.confidence:.2f}"
         )
@@ -135,45 +162,67 @@ class SignalEngine:
     async def _evaluate_asset(self, asset: str, window: PolyWindow) -> Optional[Signal]:
         window_key = f"{asset}:{window.window_ts}"
 
+        # ── חלון כבר נסחר ─────────────────────────────────────────────────
         if self._traded_windows.get(window_key):
             return None
 
         secs_remaining = window.seconds_remaining
 
+        # ── זמן ─────────────────────────────────────────────────────────────
         if secs_remaining < self._settings.min_seconds_remaining:
             return None
-
         if secs_remaining > 300:
             return None
 
+        # ── cooldown ────────────────────────────────────────────────────────
         if self.is_in_cooldown(asset):
             return None
 
+        # ── בריאות feed ────────────────────────────────────────────────────
         if not self._binance.is_asset_healthy(asset):
             return None
 
-        # Multi-timeframe delta
+        # ── delta מרובה timeframes ──────────────────────────────────────────
         delta_20s = self._binance.get_delta_pct(lookback_seconds=20.0, asset=asset)
         delta_60s = self._binance.get_delta_pct(lookback_seconds=60.0, asset=asset)
+        delta_120s = self._binance.get_delta_pct(lookback_seconds=120.0, asset=asset)
 
         if delta_20s is None:
             return None
 
         delta_abs = abs(delta_20s)
 
+        # ── סף מינימלי ──────────────────────────────────────────────────────
         if delta_abs < self._settings.min_btc_delta_pct:
             return None
 
-        # Velocity filter — reject slow/dead markets
+        # ── Spike filter: delta גבוה מדי = חשוד, עלול להתהפך ─────────────
+        if delta_abs > MAX_SPIKE_FILTER:
+            logger.debug(
+                f"{asset}: delta={delta_abs:.3f}% > {MAX_SPIKE_FILTER}% — "
+                f"spike too large, likely reversal risk, skip"
+            )
+            return None
+
+        # ── Velocity filter ─────────────────────────────────────────────────
         velocity = delta_abs / 20.0
         if velocity < self._settings.min_velocity_pct_per_sec:
             return None
 
-        # Direction consistency check
+        # ── עקביות כיוון בין timeframes ────────────────────────────────────
         direction_consistent = False
-        if delta_60s is not None:
-            direction_consistent = (delta_20s > 0 and delta_60s > 0) or (delta_20s < 0 and delta_60s < 0)
+        also_60s_consistent = False
 
+        if delta_60s is not None:
+            direction_consistent = (delta_20s > 0 and delta_60s > 0) or (
+                delta_20s < 0 and delta_60s < 0
+            )
+        if delta_120s is not None:
+            also_60s_consistent = (delta_20s > 0 and delta_120s > 0) or (
+                delta_20s < 0 and delta_120s < 0
+            )
+
+        # ── צד ──────────────────────────────────────────────────────────────
         side: Side = "UP" if delta_20s > 0 else "DOWN"
         token_id = window.token_id_up if side == "UP" else window.token_id_down
 
@@ -181,52 +230,69 @@ class SignalEngine:
         if token_price is None or token_price <= 0:
             return None
 
-        # ── Token price filters ──────────────────────────────────────────
-        # Only trade underpriced tokens (market wrong, we see value)
+        # ── פילטר מחיר טוקן ─────────────────────────────────────────────────
         if token_price > self._settings.max_token_price:
             logger.debug(
                 f"{asset}: token={token_price:.3f} > max {self._settings.max_token_price} — "
-                f"payout too low, skip"
+                f"payout too low ({(1 / token_price - 1) * 100:.0f}%), skip"
             )
             return None
 
         if token_price < self._settings.min_token_price:
-            logger.debug(f"{asset}: token={token_price:.3f} < min — suspiciously low, skip")
-            return None
-
-        # ── Win probability ───────────────────────────────────────────────
-        win_prob = estimate_win_probability(delta_abs, asset)
-
-        # Bonus for direction consistency (both timeframes agree)
-        if direction_consistent:
-            win_prob = min(0.95, win_prob * 1.06)
-
-        # Bonus for entering earlier in window (more time = more likely to be right)
-        time_bonus = min(0.025, secs_remaining / 12000.0)
-        win_prob = min(0.95, win_prob + time_bonus)
-
-        # CRITICAL: only trade when our win probability > market implied probability
-        # Token price IS the market's implied probability
-        # We need meaningful edge over the market
-        if win_prob <= token_price + 0.08:
             logger.debug(
-                f"{asset}: win_prob={win_prob:.2f} not enough above token={token_price:.2f} — skip"
+                f"{asset}: token={token_price:.3f} < min {self._settings.min_token_price} — "
+                f"suspiciously cheap, skip"
             )
             return None
 
+        # ── הסתברות ניצחון ───────────────────────────────────────────────────
+        win_prob = estimate_win_probability(delta_abs, asset)
+
+        # Bonus קטן לעקביות כיוון ב-60s (3% בלבד, לא 6%)
+        if direction_consistent:
+            win_prob = min(MAX_WIN_PROB, win_prob * 1.03)
+
+        # Bonus נוסף קטן אם גם 120s מסכים (אות חזק יותר)
+        if also_60s_consistent:
+            win_prob = min(MAX_WIN_PROB, win_prob * 1.02)
+
+        # ← הסרנו את time_bonus — לא הגיוני לתת bonus רק כי נכנסנו מוקדם
+
+        # Cap מקסימלי — לא להאמין ל-95%+ בשוק אמיתי
+        win_prob = min(win_prob, MAX_WIN_PROB)
+
+        # ── בדיקת edge מול השוק ─────────────────────────────────────────────
+        # token_price = מה השוק מאמין שהסיכוי הוא
+        # win_prob    = מה אנחנו מאמינים
+        # אנחנו נסחר רק כשיש הפרש משמעותי (EDGE_OVER_MARKET)
+        if win_prob <= token_price + EDGE_OVER_MARKET:
+            logger.debug(
+                f"{asset}: win_prob={win_prob:.2f} not enough above "
+                f"token={token_price:.2f} (need +{EDGE_OVER_MARKET}) — skip"
+            )
+            return None
+
+        # ── חישוב edge אמיתי ────────────────────────────────────────────────
+        # edge = (P(win) × $1) - cost - fees
         fee = self._settings.taker_fee_pct * token_price
         edge = win_prob * 1.0 - token_price - fee
 
         payout_pct = (payout_multiplier(token_price) - 1.0) * 100
         logger.info(
-            f"{asset} eval: {side} | delta={delta_20s:+.3f}% | vel={velocity:.5f}%/s | "
+            f"{asset} eval: {side} | "
+            f"Δ20s={delta_20s:+.3f}% Δ60s={delta_60s:+.3f}% | "
+            f"vel={velocity:.5f}%/s | consistent={direction_consistent}/{also_60s_consistent} | "
             f"token={token_price:.3f} (+{payout_pct:.0f}% if WIN) | "
             f"win_prob={win_prob:.2f} | edge={edge:.3f} | {secs_remaining:.0f}s left"
         )
 
-        if edge < self._settings.min_edge_after_fees:
+        # ── edge מינימלי ────────────────────────────────────────────────────
+        min_edge = max(self._settings.min_edge_after_fees, MIN_EDGE_HARD)
+        if edge < min_edge:
+            logger.debug(f"{asset}: edge={edge:.3f} < min={min_edge:.3f} — skip")
             return None
 
+        # ── בניית הסיגנל ────────────────────────────────────────────────────
         signal = Signal(
             side=side,
             btc_delta_pct=delta_20s,

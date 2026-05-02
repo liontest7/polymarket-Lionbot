@@ -2,18 +2,19 @@
 src/data/polymarket_feed.py
 Multi-asset 5-minute market feed.
 
-LIVE mode: queries Polymarket Gamma + CLOB APIs to find real markets.
-DEMO/PAPER mode: generates realistic synthetic 5-minute windows for all
-assets using real Binance prices — the bot trades on actual price movements,
-resolving each window based on whether the asset closed above or below its open.
-
-This allows full end-to-end paper trading testing in any environment.
+תיקונים עיקריים לעומת הגרסה הקודמת:
+  1. get_token_price — ב-paper mode מנסה CLOB אמיתי תחילה (read-only, ללא מפתחות)
+  2. _simulated_token_price — שמרני יותר, פחות "ידידותי" לסיגנלים
+  3. הוסר noise קבוע לפי window_ts (היה אותם מחירים בכל ריצה)
+  4. הוסף _clob_price_cache — לא לפנות ל-CLOB יותר מפעם בשנייה לכל טוקן
+  5. DEMO mode כעת מאמת תוצאה לפי Binance אמיתי (לא random)
 """
 
 import asyncio
 import hashlib
+import random
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 import httpx
 from loguru import logger
 
@@ -21,21 +22,25 @@ from src.models import PolyWindow, ASSET_KEYWORDS, SUPPORTED_ASSETS
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API  = "https://clob.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+
+# Cache TTL למחיר CLOB (שניות)
+CLOB_CACHE_TTL = 3.0
 
 
 def _fake_token_id(asset: str, window_ts: int, side: str) -> str:
-    """Generate a stable deterministic fake token ID for simulation."""
+    """Fake token ID דטרמיניסטי לסימולציה."""
     key = f"{asset}-{window_ts}-{side}"
     return hashlib.sha256(key.encode()).hexdigest()[:64]
 
 
 class MultiMarketFeed:
     """
-    Discovers and tracks all active 5-minute crypto Up/Down windows.
+    מגלה ועוקב אחרי כל חלונות 5 דקות הפעילים.
 
-    In LIVE mode: queries Polymarket APIs.
-    In DEMO/PAPER mode: generates synthetic windows from real Binance prices.
+    LIVE mode: שואל Polymarket APIs.
+    PAPER mode: מייצר חלונות synthetic, מנסה CLOB לקבלת מחירים,
+                ונופל ל-simulation רק אם CLOB לא נגיש.
     """
 
     def __init__(self, demo_mode: bool = True) -> None:
@@ -45,14 +50,15 @@ class MultiMarketFeed:
         self._demo_mode = demo_mode
         self._polymarket_ok: Optional[bool] = None
         self._price_feed: Optional[object] = None
+        # Cache: token_id → (price, timestamp)
+        self._clob_price_cache: Dict[str, Tuple[float, float]] = {}
 
     def set_price_feed(self, feed) -> None:
-        """Inject the BinanceFeed reference for demo mode."""
+        """מחבר את ה-BinanceFeed לשימוש בsimulation."""
         self._price_feed = feed
 
     @property
     def current_windows(self) -> Dict[str, PolyWindow]:
-        now = time.time()
         return {k: v for k, v in self._windows.items() if v.is_active}
 
     @property
@@ -77,8 +83,8 @@ class MultiMarketFeed:
             await self._run_live()
         else:
             logger.warning(
-                "Polymarket API not accessible from this environment. "
-                "Running in SIMULATION mode — real Binance prices, synthetic windows."
+                "Polymarket API not accessible. "
+                "Paper mode: synthetic windows + Binance prices for settlement."
             )
             await self._run_demo()
 
@@ -102,7 +108,7 @@ class MultiMarketFeed:
             logger.debug(f"Polymarket connectivity check failed: {e}")
             self._polymarket_ok = False
 
-    # ─── LIVE MODE (real Polymarket API) ─────────────────────────────────────
+    # ─── LIVE MODE ────────────────────────────────────────────────────────────
 
     async def _run_live(self) -> None:
         while self._running:
@@ -116,7 +122,12 @@ class MultiMarketFeed:
         try:
             resp = await self._client.get(
                 f"{GAMMA_API}/markets",
-                params={"active": "true", "closed": "false", "tag_slug": "crypto", "limit": 200},
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "tag_slug": "crypto",
+                    "limit": 200,
+                },
             )
             resp.raise_for_status()
             markets = resp.json()
@@ -142,10 +153,20 @@ class MultiMarketFeed:
 
             tokens = market.get("tokens", [])
             token_up = next(
-                (t["token_id"] for t in tokens if t.get("outcome", "").upper() in ("YES", "UP")), None
+                (
+                    t["token_id"]
+                    for t in tokens
+                    if t.get("outcome", "").upper() in ("YES", "UP")
+                ),
+                None,
             )
             token_down = next(
-                (t["token_id"] for t in tokens if t.get("outcome", "").upper() in ("NO", "DOWN")), None
+                (
+                    t["token_id"]
+                    for t in tokens
+                    if t.get("outcome", "").upper() in ("NO", "DOWN")
+                ),
+                None,
             )
             if not token_up or not token_down:
                 continue
@@ -161,14 +182,16 @@ class MultiMarketFeed:
             )
 
         if any(self._windows.values()):
-            logger.success(f"Active markets: {', '.join(sorted(self.current_windows.keys()))}")
+            logger.success(
+                f"Active markets: {', '.join(sorted(self.current_windows.keys()))}"
+            )
 
     def _classify_market(self, market: dict) -> Optional[str]:
         question = market.get("question", "").lower()
         slug = market.get("slug", "").lower()
         text = question + " " + slug
         five_min = ["5 min", "5min", "5-min", "next 5", "5 minutes"]
-        up_down  = ["up or down", "up/down", "higher or lower", "above or below"]
+        up_down = ["up or down", "up/down", "higher or lower", "above or below"]
         if not (any(x in text for x in five_min) and any(x in text for x in up_down)):
             return None
         for asset, keywords in ASSET_KEYWORDS.items():
@@ -186,15 +209,16 @@ class MultiMarketFeed:
                     pass
         return 0.0
 
-    # ─── DEMO / SIMULATION MODE ───────────────────────────────────────────────
+    # ─── DEMO / PAPER MODE ────────────────────────────────────────────────────
 
     async def _run_demo(self) -> None:
-        logger.info("Demo market simulation running — 5-min windows for all 8 assets")
-        # Wait for Binance to connect and have real prices before recording open_price
+        logger.info("Paper market simulation — 5-min windows for all assets")
+        # ממתין למחירי Binance אמיתיים לפני תחילת העבודה
         for _ in range(30):
             if self._price_feed and self._price_feed.get_price("BTC"):
                 break
             await asyncio.sleep(0.5)
+
         while self._running:
             try:
                 await self._refresh_demo()
@@ -205,7 +229,7 @@ class MultiMarketFeed:
     async def _refresh_demo(self) -> None:
         now = time.time()
         window_ts = int(now - (now % 300))
-        close_ts  = window_ts + 300
+        close_ts = window_ts + 300
 
         updated = []
         for asset in SUPPORTED_ASSETS:
@@ -214,7 +238,7 @@ class MultiMarketFeed:
                 continue
 
             open_price = self._get_open_price(asset)
-            token_up   = _fake_token_id(asset, window_ts, "UP")
+            token_up = _fake_token_id(asset, window_ts, "UP")
             token_down = _fake_token_id(asset, window_ts, "DOWN")
 
             self._windows[asset] = PolyWindow(
@@ -241,75 +265,125 @@ class MultiMarketFeed:
                 return p.price
         return 0.0
 
-    # ─── TOKEN PRICE SIMULATION ───────────────────────────────────────────────
+    # ─── TOKEN PRICE ─────────────────────────────────────────────────────────
 
     async def get_token_price(self, token_id: str) -> Optional[float]:
         """
-        Return a synthetic token price for demo mode, or real CLOB price for live.
-        For demo, simulate a market that's somewhat efficient but not perfect.
-        A 50/50 market would be at 0.50; momentum pushes it slightly.
+        מחיר טוקן:
+          - LIVE mode:  CLOB midpoint אמיתי
+          - PAPER mode: מנסה CLOB תחילה (read-only, ללא מפתחות),
+                        נופל לsimulation אם CLOB לא נגיש
         """
         if self._polymarket_ok:
             return await self._fetch_clob_price(token_id)
+
+        # Paper mode — מנסה CLOB אמיתי תחילה (קריאה בלבד, ללא auth)
+        clob_price = await self._try_clob_readonly(token_id)
+        if clob_price is not None:
+            return clob_price
+
+        # Fallback — simulation
         return await self._simulated_token_price(token_id)
 
     async def _fetch_clob_price(self, token_id: str) -> Optional[float]:
+        """CLOB midpoint עם cache."""
+        # בדיקת cache
+        cached = self._clob_price_cache.get(token_id)
+        if cached:
+            price, ts = cached
+            if time.time() - ts < CLOB_CACHE_TTL:
+                return price
+
         try:
             resp = await self._client.get(
                 f"{CLOB_API}/midpoint",
                 params={"token_id": token_id},
             )
             resp.raise_for_status()
-            return float(resp.json().get("mid", 0))
+            mid = resp.json().get("mid")
+            if mid is not None:
+                price = float(mid)
+                self._clob_price_cache[token_id] = (price, time.time())
+                return price
         except Exception as e:
             logger.debug(f"CLOB price error ({token_id[:8]}...): {e}")
-            return None
+        return None
+
+    async def _try_clob_readonly(self, token_id: str) -> Optional[float]:
+        """
+        מנסה לשאול את CLOB ב-paper mode (ללא authentication).
+        חלק מהendpoints של Polymarket נגישים read-only.
+        """
+        # בדיקת cache
+        cached = self._clob_price_cache.get(token_id)
+        if cached:
+            price, ts = cached
+            if time.time() - ts < CLOB_CACHE_TTL:
+                return price
+
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                resp = await client.get(
+                    f"{CLOB_API}/midpoint",
+                    params={"token_id": token_id},
+                )
+                if resp.status_code == 200:
+                    mid = resp.json().get("mid")
+                    if mid is not None:
+                        price = float(mid)
+                        self._clob_price_cache[token_id] = (price, time.time())
+                        logger.debug(
+                            f"CLOB readonly price: {token_id[:10]}... → {price:.3f}"
+                        )
+                        return price
+        except Exception:
+            pass
+        return None
 
     async def _simulated_token_price(self, token_id: str) -> Optional[float]:
         """
-        Simulate a token price that reflects the LAG between Binance and Polymarket.
+        מחיר מדומה לpaper mode כשCLOB לא נגיש.
 
-        Key insight: The market prices in the LONGER-TERM trend but NOT the very
-        recent short-term move. Our signal detects the recent move BEFORE the
-        market reprices — that is the edge we exploit.
+        תיקון מרכזי לעומת הגרסה הקודמת:
+          - noise אקראי בכל קריאה (לא קבוע לפי window_ts)
+          - שמרני יותר: range צר יותר (0.35–0.65 במקום 0.10–0.78)
+          - הטיה קטנה בלבד לפי הtrend הארוך (120s)
+          - מטרה: לא "לעזור" לסיגנל לעבור threshold
 
-        So: token price = f(long-term trend) + window_noise
-                        ≠ f(recent 20s spike our signal detected)
-
-        This creates tokens in the 0.28–0.60 range where good risk/reward exists.
+        ⚠️  הסימולציה הזו לא מחליפה בדיקה על CLOB אמיתי!
+            אם הבוט מראה תוצאות טובות בsimulation אבל רעות בlive —
+            הסיבה היא שמחירי הsimulation לא מייצגים שוק אמיתי.
         """
         window_info = self._find_window_by_token(token_id)
         if window_info is None:
-            return 0.45
+            return 0.50  # ברירת מחדל: שוק מאוזן
 
         asset, window, side = window_info
         if self._price_feed is None:
-            return 0.45
+            return 0.50
 
-        # Use LONG-TERM delta (120s) = what the market has already priced in
-        # The recent 20-30s spike is OUR edge — market hasn't caught up
+        # Trend ארוך (120s) — מה השוק כבר מתמחר
         delta_long = self._price_feed.get_delta_pct(lookback_seconds=120.0, asset=asset)
 
         base = 0.50
 
         if delta_long is not None:
-            # Market slowly prices in the 2-minute trend
-            consensus_move = min(abs(delta_long) * 1.2, 0.12)
+            # הטיה קטנה לפי trend (מקסימום ±0.08)
+            consensus = min(abs(delta_long) * 0.8, 0.08)
             if (delta_long > 0 and side == "UP") or (delta_long < 0 and side == "DOWN"):
-                base = 0.50 + consensus_move
+                base = 0.50 + consensus
             else:
-                base = 0.50 - consensus_move
+                base = 0.50 - consensus
 
-        # Window-specific noise: each window starts with a different market bias
-        # This simulates natural variation in market maker pricing
-        import hashlib
-        seed_val = int(hashlib.md5(f"{asset}{window.window_ts}{side}".encode()).hexdigest()[:8], 16)
-        noise_range = 0.14
-        noise = (seed_val % 1000) / 1000.0 * noise_range - (noise_range / 2)
+        # noise אקראי בכל קריאה — לא קבוע!
+        # טווח: ±0.06 (לא ±0.07 כבעבר)
+        noise = (random.random() - 0.5) * 0.12
+
         price = base + noise
 
-        # Realistic Polymarket price bounds (not too close to 0 or 1)
-        return round(max(0.10, min(0.78, price)), 3)
+        # bounds שמרניים: לא פחות מ-0.35 ולא יותר מ-0.65
+        # (market שחושב <35% או >65% בחלון 5 דקות בלבד הוא נדיר)
+        return round(max(0.35, min(0.65, price)), 3)
 
     def _find_window_by_token(self, token_id: str):
         for asset, window in self._windows.items():
@@ -322,7 +396,9 @@ class MultiMarketFeed:
     async def get_order_book(self, token_id: str) -> Optional[dict]:
         if self._polymarket_ok:
             try:
-                resp = await self._client.get(f"{CLOB_API}/book", params={"token_id": token_id})
+                resp = await self._client.get(
+                    f"{CLOB_API}/book", params={"token_id": token_id}
+                )
                 resp.raise_for_status()
                 return resp.json()
             except Exception:
