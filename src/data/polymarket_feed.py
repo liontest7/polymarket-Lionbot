@@ -190,6 +190,11 @@ class MultiMarketFeed:
 
     async def _run_demo(self) -> None:
         logger.info("Demo market simulation running — 5-min windows for all 8 assets")
+        # Wait for Binance to connect and have real prices before recording open_price
+        for _ in range(30):
+            if self._price_feed and self._price_feed.get_price("BTC"):
+                break
+            await asyncio.sleep(0.5)
         while self._running:
             try:
                 await self._refresh_demo()

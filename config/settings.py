@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # Signal — entry allowed ANY time in window
     min_btc_delta_pct: float = Field(0.04, description="Min price move % in 20s lookback")
     min_velocity_pct_per_sec: float = Field(0.0015, description="Min price velocity (%/sec)")
-    min_edge_after_fees: float = Field(0.04, description="Min expected edge after fees (stricter = better quality trades)")
+    min_edge_after_fees: float = Field(0.05, description="Min expected edge after fees (stricter = better quality trades)")
     min_seconds_remaining: int = Field(10, description="Do not enter if less than N seconds to close")
 
     # Token price filtering — controls risk/reward ratio
@@ -44,8 +44,8 @@ class Settings(BaseSettings):
     preferred_token_max: float = Field(0.45, description="Tokens below this get a payout bonus in ranking")
 
     # Exit management
-    tp_token_gain: float = Field(0.20, description="Take profit when implied token rises by this much")
-    sl_token_loss: float = Field(0.10, description="Stop loss when implied token falls by this much")
+    tp_token_gain: float = Field(0.08, description="Take profit when implied token rises by this much")
+    sl_token_loss: float = Field(0.05, description="Stop loss when implied token falls by this much")
     time_stop_seconds: float = Field(260.0, description="Max seconds to hold — near window close")
 
     # Fees

@@ -46,9 +46,28 @@ class PolyBot:
 
     def _get_open_trades_list(self) -> list:
         result = []
+        now = time.time()
         for trade in self._executor.open_trades.values():
             asset_price = self._binance.get_price(trade.asset)
             current_price = asset_price.price if asset_price else None
+
+            # Compute live implied P&L using same sensitivity formula as executor
+            implied_pnl = None
+            implied_status = "neutral"
+            if current_price and current_price > 0 and trade.entry_asset_price > 0:
+                move_pct = (current_price - trade.entry_asset_price) / trade.entry_asset_price
+                secs_in_trade = now - trade.entry_time
+                sensitivity = 10.0 + min(25.0, secs_in_trade * 0.15)
+                if trade.side == "UP":
+                    implied_gain = move_pct * sensitivity
+                else:
+                    implied_gain = -move_pct * sensitivity
+                implied_pnl = round(trade.shares * implied_gain, 2)
+                if implied_gain > 0.02:
+                    implied_status = "winning"
+                elif implied_gain < -0.02:
+                    implied_status = "losing"
+
             result.append({
                 "id": trade.id,
                 "asset": trade.asset,
@@ -62,6 +81,9 @@ class PolyBot:
                 "notes": trade.notes,
                 "window_ts": trade.window_ts,
                 "current_asset_price": current_price,
+                "entry_asset_price": trade.entry_asset_price,
+                "implied_pnl": implied_pnl,
+                "implied_status": implied_status,
             })
         return result
 

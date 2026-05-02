@@ -697,29 +697,32 @@ function renderOpenTrades(openTrades, markets) {
     const pct = market ? ((secsLeft / totalSecs) * 100).toFixed(1) : 50;
     const timeClass = secsLeft < 15 ? 'hot' : secsLeft < 30 ? 'warn' : '';
 
+    // Use backend-computed implied P&L and status (accurate, matches TP/SL logic)
+    const impliedPnl = t.implied_pnl;
+    const impliedStatus = t.implied_status || 'neutral';
     const currentAssetPrice = t.current_asset_price;
-    const openPrice = market ? market.open_price : 0;
 
-    let livePnlHtml = '';
     let cardClass = 'open-trade-card';
-    let isWinning = null;
+    let livePnlHtml = '';
 
-    if (currentAssetPrice && openPrice > 0) {
-      const priceMoved = ((currentAssetPrice - openPrice) / openPrice * 100);
-      const priceMovedUp = priceMoved >= 0;
-      isWinning = (t.side === 'UP' && priceMovedUp) || (t.side === 'DOWN' && !priceMovedUp);
-      cardClass = isWinning ? 'open-trade-card winning' : 'open-trade-card losing';
-      const statusText = isWinning ? '&#9650; WINNING' : '&#9660; LOSING';
-      const statusColor = isWinning ? 'var(--green)' : 'var(--red)';
+    if (impliedStatus === 'winning') cardClass = 'open-trade-card winning';
+    else if (impliedStatus === 'losing') cardClass = 'open-trade-card losing';
+
+    if (currentAssetPrice) {
       const priceStr = '$' + currentAssetPrice.toLocaleString('en', {minimumFractionDigits:2, maximumFractionDigits:2});
+      const statusIcon = impliedStatus === 'winning' ? '&#9650; WINNING' : impliedStatus === 'losing' ? '&#9660; LOSING' : '&#9654; NEUTRAL';
+      const statusColor = impliedStatus === 'winning' ? 'var(--green)' : impliedStatus === 'losing' ? 'var(--red)' : 'var(--dim)';
+      const impliedPnlStr = impliedPnl !== null && impliedPnl !== undefined
+        ? `<span class="live-pnl ${impliedPnl >= 0 ? 'pos' : 'neg'}" style="margin-left:8px;">${impliedPnl >= 0 ? '+' : ''}$${Math.abs(impliedPnl).toFixed(2)}</span>`
+        : '';
       livePnlHtml = `<div class="open-trade-row">
-        <span class="otl">${t.asset} Price Now</span>
-        <span class="otv">${priceStr} <span style="color:${statusColor};font-size:11px;">${statusText}</span></span>
+        <span class="otl">${t.asset} Now</span>
+        <span class="otv">${priceStr}${impliedPnlStr} <span style="color:${statusColor};font-size:10px;margin-left:4px;">${statusIcon}</span></span>
       </div>`;
     }
 
     const projWin = (t.shares * (1.0 - t.entry_price) - t.fees_paid).toFixed(2);
-    const projLoss = (-t.size_usd).toFixed(2);
+    const slLoss = (t.size_usd * 0.05 / t.entry_price).toFixed(2);
     const sideClass = t.side === 'UP' ? 'open-trade-side-up' : 'open-trade-side-down';
     const sideIcon = t.side === 'UP' ? '&#9650;' : '&#9660;';
     const openTime = new Date(t.entry_time * 1000).toTimeString().slice(0,8);
@@ -735,13 +738,13 @@ function renderOpenTrades(openTrades, markets) {
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 24px;">
         <div>
           <div class="open-trade-row"><span class="otl">Size</span><span class="otv">$${t.size_usd.toFixed(2)}</span></div>
-          <div class="open-trade-row"><span class="otl">Entry Price</span><span class="otv">${t.entry_price.toFixed(3)}</span></div>
-          <div class="open-trade-row"><span class="otl">Entered at</span><span class="otv">${openTime}</span></div>
+          <div class="open-trade-row"><span class="otl">Token Entry</span><span class="otv">${t.entry_price.toFixed(3)}</span></div>
+          <div class="open-trade-row"><span class="otl">Opened</span><span class="otv">${openTime}</span></div>
           ${livePnlHtml}
         </div>
         <div>
-          <div class="open-trade-row"><span class="otl">If WIN</span><span class="otv proj-win">+$${projWin}</span></div>
-          <div class="open-trade-row"><span class="otl">If LOSS</span><span class="otv proj-lose">$${projLoss}</span></div>
+          <div class="open-trade-row"><span class="otl">TP Target</span><span class="otv proj-win">+$${projWin}</span></div>
+          <div class="open-trade-row"><span class="otl">SL Exit</span><span class="otv proj-lose">~-$${slLoss}</span></div>
           <div class="open-trade-row"><span class="otl">Fees</span><span class="otv">$${(t.fees_paid||0).toFixed(2)}</span></div>
         </div>
       </div>

@@ -50,6 +50,12 @@ class PaperExecutor:
         size_usd = risk_status.suggested_size_usd
         fee = size_usd * self._settings.taker_fee_pct
 
+        entry_asset_price = 0.0
+        if self._binance:
+            ap = self._binance.get_price(signal.asset)
+            if ap:
+                entry_asset_price = ap.price
+
         trade = Trade(
             id=trade_id,
             window_ts=window.window_ts,
@@ -62,18 +68,13 @@ class PaperExecutor:
             mode="paper",
             asset=signal.asset,
             fees_paid=fee,
+            entry_asset_price=entry_asset_price,
             notes=(
                 f"{signal.asset} delta={signal.btc_delta_pct:+.3f}% "
                 f"edge={signal.edge_after_fees:.3f} "
                 f"{window.seconds_remaining:.0f}s_left"
             ),
         )
-
-        entry_asset_price = 0.0
-        if self._binance:
-            ap = self._binance.get_price(signal.asset)
-            if ap:
-                entry_asset_price = ap.price
 
         self._open_trades[trade_id] = trade
         self._risk.record_trade_open(trade)
@@ -167,13 +168,18 @@ class PaperExecutor:
                 if ap:
                     price_move_pct = (ap.price - entry_asset_price) / entry_asset_price
 
-                    # Implied token price based on Binance move
-                    # UP bet: token rises when price rises
-                    # DOWN bet: token rises when price falls
+                    # Dynamic sensitivity: as the trade ages and window closes,
+                    # even small Binance moves have a larger impact on the binary
+                    # outcome probability. Sensitivity grows from ~10 to ~35 over
+                    # the course of a typical 260s hold.
+                    sensitivity = 10.0 + min(25.0, secs_in_trade * 0.15)
+
+                    # Implied token price: how much the market probability has shifted
+                    # UP bet wins when price goes up; DOWN bet wins when price goes down
                     if trade.side == "UP":
-                        implied_token = entry_token + price_move_pct * 0.85
+                        implied_token = entry_token + price_move_pct * sensitivity
                     else:
-                        implied_token = entry_token - price_move_pct * 0.85
+                        implied_token = entry_token - price_move_pct * sensitivity
 
                     implied_token = max(0.02, min(0.98, implied_token))
                     token_change = implied_token - entry_token
@@ -261,12 +267,17 @@ class PaperExecutor:
             await self._close_trade(trade)
             return
 
-        if open_price > 0 and close_price > 0:
-            went_up = close_price >= open_price
+        # Use trade's entry_asset_price as fallback when window open_price wasn't
+        # recorded (happens in demo mode if Binance wasn't ready at window creation)
+        effective_open = open_price if open_price > 0 else trade.entry_asset_price
+
+        if effective_open > 0 and close_price > 0:
+            went_up = close_price >= effective_open
             trade_won = (went_up and trade.side == "UP") or (not went_up and trade.side == "DOWN")
         else:
+            # Last resort: estimate from signal confidence
             import random
-            trade_won = random.random() < (trade.entry_price + 0.05)
+            trade_won = random.random() < trade.entry_price
 
         if trade_won:
             trade.result = "WIN"

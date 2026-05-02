@@ -115,6 +115,7 @@ class Trade:
     pnl_usd: float = 0.0
     fees_paid: float = 0.0
     notes: str = ""
+    entry_asset_price: float = 0.0
 
     @property
     def is_closed(self) -> bool:
