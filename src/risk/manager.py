@@ -70,8 +70,8 @@ class RiskManager:
                 reason=f"Max trades/day reached: {self._trade_count_today}/{self._settings.max_trades_per_day}",
             )
 
-        # Total drawdown check (25% from peak)
-        drawdown = (self._peak_capital - self._current_capital) / self._peak_capital
+        # Total drawdown check — smart: reduce at 15%, stop at 25%
+        drawdown = (self._peak_capital - self._current_capital) / self._peak_capital if self._peak_capital > 0 else 0
         if drawdown >= 0.25:
             return RiskStatus(
                 trading_allowed=False,
@@ -80,6 +80,14 @@ class RiskManager:
 
         # Position sizing — fractional Kelly
         size_usd = self._kelly_size(signal)
+
+        # Reduce position size as drawdown increases
+        if drawdown >= 0.15:
+            size_usd *= 0.5
+            logger.warning(f"Drawdown {drawdown:.1%} — position size halved to ${size_usd:.2f}")
+        elif drawdown >= 0.10:
+            size_usd *= 0.75
+            logger.info(f"Drawdown {drawdown:.1%} — position size reduced 25% to ${size_usd:.2f}")
 
         # Cap at max_position_usd
         size_usd = min(size_usd, self._settings.max_position_usd)

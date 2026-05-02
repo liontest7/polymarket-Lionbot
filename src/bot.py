@@ -2,7 +2,6 @@
 src/bot.py
 Main bot orchestrator — multi-asset, start/stop controllable.
 All feeds, signals, execution wired here.
-Dashboard: http://localhost:8080
 """
 
 import asyncio
@@ -28,8 +27,42 @@ class PolyBot:
         self._polymarket.set_price_feed(self._binance)
         self._risk = RiskManager(settings)
         self._signal_engine = SignalEngine(self._binance, self._polymarket, settings)
-        self._executor = create_executor(settings, self._risk)
+        self._executor = create_executor(settings, self._risk, on_resolve=self._on_trade_resolved)
         self._tasks: list[asyncio.Task] = []
+
+    async def _on_trade_resolved(self, trade) -> None:
+        update_from_bot(
+            risk=self._risk,
+            settings=self._settings,
+            new_trade=trade,
+            running=self._running,
+            open_trades=self._get_open_trades_list(),
+        )
+        await broadcast_state()
+
+    def _get_open_trades_list(self) -> list:
+        result = []
+        for trade in self._executor.open_trades.values():
+            asset_price = self._binance.get_price(trade.asset)
+            current_price = asset_price.price if asset_price else None
+            result.append({
+                "id": trade.id,
+                "asset": trade.asset,
+                "side": trade.side,
+                "entry_price": trade.entry_price,
+                "size_usd": trade.size_usd,
+                "shares": trade.shares,
+                "fees_paid": trade.fees_paid,
+                "entry_time": trade.entry_time,
+                "mode": trade.mode,
+                "notes": trade.notes,
+                "window_ts": trade.window_ts,
+                "current_asset_price": current_price,
+            })
+        return result
+
+    async def force_resolve_trade(self, trade_id: str) -> bool:
+        return await self._executor.force_resolve(trade_id)
 
     async def run(self) -> None:
         self._running = True
@@ -37,7 +70,7 @@ class PolyBot:
         logger.info("POLYMARKET MULTI-ASSET BOT  v4.0")
         logger.info(f"Mode: {self._settings.trading_mode.upper()}")
         logger.info(f"Capital: ${self._settings.capital_usd}")
-        logger.info(f"Assets: BTC, ETH, SOL, XRP, MATIC, DOGE, LINK, AVAX")
+        logger.info("Assets: BTC, ETH, SOL, XRP, MATIC, DOGE, LINK, AVAX")
         logger.info(f"Dashboard: http://localhost:5000")
         logger.info("=" * 60)
 
@@ -67,7 +100,7 @@ class PolyBot:
             logger.info("Bot shutdown requested")
 
     async def _evaluation_loop(self) -> None:
-        logger.info("Evaluation loop started")
+        logger.info("Evaluation loop started — scanning all 8 assets every second")
         while self._running:
             try:
                 await self._tick()
@@ -80,6 +113,14 @@ class PolyBot:
         btc_price = self._binance.get_price("BTC")
         delta = self._binance.get_delta_pct(20.0, "BTC")
 
+        asset_prices = {}
+        for asset in ["BTC", "ETH", "SOL", "XRP", "MATIC", "DOGE", "LINK", "AVAX"]:
+            ap = self._binance.get_price(asset)
+            if ap:
+                asset_prices[asset] = ap.price
+
+        open_trades = self._get_open_trades_list()
+
         update_from_bot(
             risk=self._risk,
             settings=self._settings,
@@ -87,20 +128,25 @@ class PolyBot:
             windows=windows,
             delta=delta,
             running=True,
+            open_trades=open_trades,
+            asset_prices=asset_prices,
         )
 
         signal = await self._signal_engine.evaluate()
         if signal is None:
+            await broadcast_state()
             return
 
         asset = signal.asset
         window = windows.get(asset)
         if window is None:
+            await broadcast_state()
             return
 
         risk_status = self._risk.evaluate(signal)
         if not risk_status.trading_allowed:
             logger.warning(f"Trade blocked: {risk_status.reason}")
+            await broadcast_state()
             return
 
         trade = await self._executor.execute(signal, window, risk_status)
@@ -111,17 +157,20 @@ class PolyBot:
                 new_trade=trade,
                 running=True,
                 last_signal=f"{signal.asset} {signal.side} | delta={signal.btc_delta_pct:+.3f}% | edge={signal.edge_after_fees:.3f}",
+                open_trades=self._get_open_trades_list(),
+                asset_prices=asset_prices,
             )
-            await broadcast_state()
             logger.success(
-                f"Trade: {trade.id} | {trade.asset} {trade.side} | "
-                f"${trade.size_usd:.2f} | {trade.mode}"
+                f"Trade opened: {trade.id} | {trade.asset} {trade.side} | "
+                f"${trade.size_usd:.2f} | {trade.mode.upper()}"
             )
+
+        await broadcast_state()
 
     async def stop(self) -> None:
         logger.info("Stopping bot...")
         self._running = False
-        update_from_bot(risk=self._risk, settings=self._settings, running=False)
+        update_from_bot(risk=self._risk, settings=self._settings, running=False, open_trades=[])
         await broadcast_state()
         await self._binance.stop()
         await self._polymarket.stop()

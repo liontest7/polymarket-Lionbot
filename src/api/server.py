@@ -8,7 +8,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -43,9 +43,18 @@ class BotState:
         self.fees_paid: float = 0.0
         self.peak_capital: float = 0.0
         self.trades: list[dict] = []
+        self.open_trades: list[dict] = []
         self.bot_running: bool = False
         self.last_signal: Optional[str] = None
         self.last_update: float = time.time()
+        self.log_messages: list[dict] = []
+        self.asset_prices: dict = {}
+
+    def add_log(self, level: str, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        self.log_messages.append({"ts": ts, "level": level.lower(), "msg": msg})
+        if len(self.log_messages) > 150:
+            self.log_messages.pop(0)
 
     def to_dict(self) -> dict:
         return {
@@ -66,9 +75,12 @@ class BotState:
             "fees_paid": self.fees_paid,
             "peak_capital": self.peak_capital,
             "trades": self.trades[-50:],
+            "open_trades": self.open_trades,
             "bot_running": self.bot_running,
             "last_signal": self.last_signal,
             "last_update": self.last_update,
+            "log_messages": self.log_messages[-80:],
+            "asset_prices": self.asset_prices,
         }
 
 
@@ -82,6 +94,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _log_sink(message):
+    record = message.record
+    level = record["level"].name
+    if level in ("DEBUG",):
+        return
+    text = record["message"]
+    bot_state.add_log(level, text)
+
+
+logger.add(_log_sink, level="INFO", format="{message}")
 
 
 class ConnectionManager:
@@ -114,6 +138,7 @@ ENV_PATH = Path(__file__).parent.parent.parent / ".env"
 
 _bot_task: Optional[asyncio.Task] = None
 _bot_settings: Optional[Settings] = None
+_bot_instance = None
 
 
 def _read_env() -> dict:
@@ -211,7 +236,7 @@ async def save_settings(request: Request):
 
 @app.post("/api/bot/start")
 async def bot_start():
-    global _bot_task, _bot_settings
+    global _bot_task, _bot_settings, _bot_instance
     if _bot_task and not _bot_task.done():
         return JSONResponse({"ok": False, "message": "Bot already running"})
 
@@ -222,6 +247,7 @@ async def bot_start():
 
         from src.bot import PolyBot
         bot = PolyBot(s)
+        _bot_instance = bot
 
         _bot_task = asyncio.create_task(bot.run(), name="bot_main")
         bot_state.bot_running = True
@@ -235,7 +261,7 @@ async def bot_start():
 
 @app.post("/api/bot/stop")
 async def bot_stop():
-    global _bot_task
+    global _bot_task, _bot_instance
     if _bot_task is None or _bot_task.done():
         bot_state.bot_running = False
         await broadcast_state()
@@ -246,7 +272,9 @@ async def bot_stop():
     except (asyncio.CancelledError, asyncio.TimeoutError):
         pass
     _bot_task = None
+    _bot_instance = None
     bot_state.bot_running = False
+    bot_state.open_trades = []
     await broadcast_state()
     logger.info("Bot stopped via API")
     return JSONResponse({"ok": True, "message": "Bot stopped"})
@@ -256,6 +284,21 @@ async def bot_stop():
 async def bot_status():
     running = _bot_task is not None and not _bot_task.done()
     return JSONResponse({"running": running})
+
+
+@app.post("/api/trades/{trade_id}/resolve")
+async def force_resolve_trade(trade_id: str):
+    global _bot_instance
+    if _bot_instance is None:
+        return JSONResponse({"ok": False, "message": "Bot not running"}, status_code=400)
+    try:
+        result = await _bot_instance.force_resolve_trade(trade_id)
+        if result:
+            return JSONResponse({"ok": True, "message": f"Trade {trade_id} resolved"})
+        else:
+            return JSONResponse({"ok": False, "message": "Trade not found or already resolved"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
 
 
 @app.websocket("/ws")
@@ -283,6 +326,8 @@ def update_from_bot(
     new_trade: Optional[Trade] = None,
     running: bool = True,
     last_signal: Optional[str] = None,
+    open_trades: Optional[list] = None,
+    asset_prices: Optional[dict] = None,
 ):
     bot_state.bot_running = running
     bot_state.mode = settings.trading_mode
@@ -293,6 +338,8 @@ def update_from_bot(
         bot_state.btc_delta = delta
     if last_signal:
         bot_state.last_signal = last_signal
+    if asset_prices is not None:
+        bot_state.asset_prices = asset_prices
 
     if windows is not None:
         bot_state.active_markets = {
@@ -336,6 +383,9 @@ def update_from_bot(
     bot_state.trades_today = daily.trades
     bot_state.max_trades_today = settings.max_trades_per_day
 
+    if open_trades is not None:
+        bot_state.open_trades = open_trades
+
     if new_trade:
         trade_dict = {
             "id": new_trade.id,
@@ -348,6 +398,7 @@ def update_from_bot(
             "pnl_usd": new_trade.pnl_usd,
             "fees_paid": new_trade.fees_paid,
             "entry_time": new_trade.entry_time,
+            "exit_time": new_trade.exit_time,
             "mode": new_trade.mode,
             "notes": new_trade.notes,
         }
