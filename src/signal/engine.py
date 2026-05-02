@@ -278,9 +278,11 @@ class SignalEngine:
         edge = win_prob * 1.0 - token_price - fee
 
         payout_pct = (payout_multiplier(token_price) - 1.0) * 100
+        delta_60s_str = f"{delta_60s:+.3f}%" if delta_60s is not None else "n/a"
+        delta_120s_str = f"{delta_120s:+.3f}%" if delta_120s is not None else "n/a"
         logger.info(
             f"{asset} eval: {side} | "
-            f"Δ20s={delta_20s:+.3f}% Δ60s={delta_60s:+.3f}% | "
+            f"Δ20s={delta_20s:+.3f}% Δ60s={delta_60s_str} Δ120s={delta_120s_str} | "
             f"vel={velocity:.5f}%/s | consistent={direction_consistent}/{also_60s_consistent} | "
             f"token={token_price:.3f} (+{payout_pct:.0f}% if WIN) | "
             f"win_prob={win_prob:.2f} | edge={edge:.3f} | {secs_remaining:.0f}s left"
