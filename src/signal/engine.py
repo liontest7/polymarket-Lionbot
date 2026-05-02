@@ -1,18 +1,16 @@
 """
 src/signal/engine.py
-Multi-asset signal engine — evaluates ALL active 5-min markets,
-picks the best edge opportunity, prioritising Win Rate then volume.
+Multi-asset signal engine — evaluates ALL active 5-min markets.
 
-Strategy per asset:
-  1. Wait until T-25 seconds before window close
-  2. Calculate asset price delta (% move in last 20 seconds)
-  3. If delta > threshold → signal candidate
-  4. Calculate token price and expected edge after fees
-  5. Return best edge signal across all assets
+Strategy:
+  - Entry allowed at ANY point in the 5-minute window (not just last 25s)
+  - Requires: price velocity + delta threshold + minimum edge
+  - Filters out: dead markets, already-traded windows, cooldown periods
+  - Ranks candidates by: edge * confidence (EV proxy)
 """
 
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict
 from loguru import logger
 
 from src.models import Signal, PolyWindow, Side, SUPPORTED_ASSETS
@@ -22,14 +20,15 @@ from config.settings import Settings
 
 
 DELTA_TO_WIN_PROB = [
-    (0.02, 0.54),
-    (0.03, 0.57),
-    (0.05, 0.62),
-    (0.07, 0.67),
-    (0.10, 0.73),
-    (0.15, 0.81),
-    (0.20, 0.87),
-    (0.30, 0.93),
+    (0.01, 0.52),
+    (0.02, 0.55),
+    (0.03, 0.58),
+    (0.05, 0.63),
+    (0.07, 0.68),
+    (0.10, 0.74),
+    (0.15, 0.82),
+    (0.20, 0.88),
+    (0.30, 0.94),
 ]
 
 ASSET_VOLATILITY = {
@@ -37,7 +36,7 @@ ASSET_VOLATILITY = {
     "ETH":  1.1,
     "SOL":  1.3,
     "XRP":  1.2,
-    "MATIC":1.25,
+    "MATIC": 1.25,
     "DOGE": 1.3,
     "LINK": 1.15,
     "AVAX": 1.2,
@@ -65,8 +64,8 @@ def estimate_win_probability(delta_abs: float, asset: str = "BTC") -> float:
 
 class SignalEngine:
     """
-    Evaluates all active markets every second and produces the best signal.
-    Prioritises: Win Rate first, then edge magnitude.
+    Evaluates all active markets every second.
+    Entry allowed at ANY time during the window when signal conditions are met.
     """
 
     def __init__(
@@ -78,7 +77,18 @@ class SignalEngine:
         self._binance = binance
         self._polymarket = polymarket
         self._settings = settings
-        self._traded_windows: dict[str, int] = {}
+        self._traded_windows: Dict[str, int] = {}
+        self._last_trade_time: Dict[str, float] = {}
+
+    def mark_traded(self, asset: str, window_ts: int) -> None:
+        """Call after a trade is opened to prevent re-entry."""
+        key = f"{asset}:{window_ts}"
+        self._traded_windows[key] = 1
+        self._last_trade_time[asset] = time.time()
+
+    def is_in_cooldown(self, asset: str) -> bool:
+        last = self._last_trade_time.get(asset, 0.0)
+        return (time.time() - last) < self._settings.cooldown_seconds
 
     async def evaluate(self) -> Optional[Signal]:
         """
@@ -86,7 +96,6 @@ class SignalEngine:
         """
         windows = self._polymarket.current_windows
         if not windows:
-            logger.debug("No active windows")
             return None
 
         candidates: List[Signal] = []
@@ -99,12 +108,13 @@ class SignalEngine:
         if not candidates:
             return None
 
-        # Rank: highest confidence first (win rate proxy), then edge
-        candidates.sort(key=lambda s: (s.confidence, s.edge_after_fees), reverse=True)
+        # Rank by EV proxy: edge * confidence — maximises expected value
+        candidates.sort(key=lambda s: s.edge_after_fees * s.confidence, reverse=True)
         best = candidates[0]
         logger.success(
-            f"BEST SIGNAL → {best.asset} {best.side} | "
-            f"edge={best.edge_after_fees:.3f} | confidence={best.confidence:.2f}"
+            f"SIGNAL → {best.asset} {best.side} | "
+            f"edge={best.edge_after_fees:.3f} | conf={best.confidence:.2f} | "
+            f"ev={best.edge_after_fees * best.confidence:.4f}"
         )
         return best
 
@@ -115,28 +125,53 @@ class SignalEngine:
             return None
 
         secs_remaining = window.seconds_remaining
-        if secs_remaining > self._settings.entry_window_seconds:
+
+        # Don't enter if window is almost closed
+        if secs_remaining < self._settings.min_seconds_remaining:
             return None
-        if secs_remaining < 5:
+
+        # Don't enter if window is not active
+        if secs_remaining > 300:
+            return None
+
+        # Cooldown per asset
+        if self.is_in_cooldown(asset):
+            logger.debug(f"{asset}: in cooldown — skip")
             return None
 
         if not self._binance.is_asset_healthy(asset):
             logger.debug(f"{asset}: feed unhealthy, skipping")
             return None
 
-        delta_pct = self._binance.get_delta_pct(lookback_seconds=20.0, asset=asset)
-        if delta_pct is None:
+        # ── Multi-timeframe delta analysis ──────────────────────────────
+        delta_20s = self._binance.get_delta_pct(lookback_seconds=20.0, asset=asset)
+        delta_60s = self._binance.get_delta_pct(lookback_seconds=60.0, asset=asset)
+
+        if delta_20s is None:
             logger.debug(f"{asset}: insufficient price history")
             return None
 
-        delta_abs = abs(delta_pct)
+        delta_abs_20s = abs(delta_20s)
 
-        min_delta = self._settings.min_btc_delta_pct
-        if delta_abs < min_delta:
-            logger.debug(f"{asset}: delta {delta_abs:.3f}% < {min_delta}% threshold")
+        # Primary delta threshold
+        if delta_abs_20s < self._settings.min_btc_delta_pct:
+            logger.debug(f"{asset}: delta {delta_abs_20s:.3f}% < {self._settings.min_btc_delta_pct}% threshold")
             return None
 
-        side: Side = "UP" if delta_pct > 0 else "DOWN"
+        # ── Price Velocity filter ────────────────────────────────────────
+        # velocity = % move per second over 20s window
+        velocity = delta_abs_20s / 20.0
+        if velocity < self._settings.min_velocity_pct_per_sec:
+            logger.debug(f"{asset}: velocity {velocity:.5f}%/s < {self._settings.min_velocity_pct_per_sec}%/s — slow market")
+            return None
+
+        # ── Direction consistency check ──────────────────────────────────
+        # If 60s delta confirms the same direction as 20s — higher confidence
+        direction_consistent = False
+        if delta_60s is not None:
+            direction_consistent = (delta_20s > 0 and delta_60s > 0) or (delta_20s < 0 and delta_60s < 0)
+
+        side: Side = "UP" if delta_20s > 0 else "DOWN"
         token_id = window.token_id_up if side == "UP" else window.token_id_down
 
         token_price = await self._polymarket.get_token_price(token_id)
@@ -144,22 +179,31 @@ class SignalEngine:
             logger.debug(f"{asset}: could not fetch token price")
             return None
 
-        if token_price >= 0.98:
-            logger.debug(f"{asset}: token price {token_price} too high — already priced in")
+        # Filter already-priced-in or suspiciously extreme markets
+        if token_price >= 0.95:
+            logger.debug(f"{asset}: token price {token_price:.3f} already priced in")
+            return None
+        if token_price <= 0.05:
+            logger.debug(f"{asset}: token price {token_price:.3f} suspiciously low")
             return None
 
-        if token_price <= 0.02:
-            logger.debug(f"{asset}: token price {token_price} suspiciously low")
-            return None
+        # ── Win probability with consistency bonus ───────────────────────
+        win_prob = estimate_win_probability(delta_abs_20s, asset)
+        if direction_consistent:
+            win_prob = min(0.95, win_prob * 1.05)
 
-        win_prob = estimate_win_probability(delta_abs, asset)
+        # Bonus for entries earlier in the window (more time = more chance to be right)
+        time_bonus = min(0.03, secs_remaining / 10000.0)
+        win_prob = min(0.95, win_prob + time_bonus)
+
         fee = self._settings.taker_fee_pct * token_price
         edge = win_prob * 1.0 - token_price - fee
 
         logger.info(
-            f"{asset} signal: {side} | delta={delta_pct:+.3f}% | "
+            f"{asset} eval: {side} | delta={delta_20s:+.3f}% | vel={velocity:.5f}%/s | "
             f"token={token_price:.3f} | win_prob={win_prob:.2f} | "
-            f"edge={edge:.3f} | {secs_remaining:.0f}s left"
+            f"edge={edge:.3f} | {secs_remaining:.0f}s left | "
+            f"consistent={'YES' if direction_consistent else 'no'}"
         )
 
         if edge < self._settings.min_edge_after_fees:
@@ -167,7 +211,7 @@ class SignalEngine:
 
         signal = Signal(
             side=side,
-            btc_delta_pct=delta_pct,
+            btc_delta_pct=delta_20s,
             token_price=token_price,
             expected_payout=1.0,
             edge_after_fees=edge,
@@ -177,7 +221,6 @@ class SignalEngine:
         )
 
         if signal.is_tradeable:
-            self._traded_windows[window_key] = 1
             return signal
 
         return None

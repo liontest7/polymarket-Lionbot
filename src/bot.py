@@ -1,7 +1,6 @@
 """
 src/bot.py
 Main bot orchestrator — multi-asset, start/stop controllable.
-All feeds, signals, execution wired here.
 """
 
 import asyncio
@@ -27,7 +26,12 @@ class PolyBot:
         self._polymarket.set_price_feed(self._binance)
         self._risk = RiskManager(settings)
         self._signal_engine = SignalEngine(self._binance, self._polymarket, settings)
-        self._executor = create_executor(settings, self._risk, on_resolve=self._on_trade_resolved)
+        self._executor = create_executor(
+            settings,
+            self._risk,
+            on_resolve=self._on_trade_resolved,
+            binance_feed=self._binance,
+        )
         self._tasks: list[asyncio.Task] = []
 
     async def _on_trade_resolved(self, trade) -> None:
@@ -67,11 +71,12 @@ class PolyBot:
     async def run(self) -> None:
         self._running = True
         logger.info("=" * 60)
-        logger.info("POLYMARKET MULTI-ASSET BOT  v4.0")
+        logger.info("POLYMARKET MULTI-ASSET BOT  v4.1 PRO")
         logger.info(f"Mode: {self._settings.trading_mode.upper()}")
         logger.info(f"Capital: ${self._settings.capital_usd}")
+        logger.info(f"Entry: ANY TIME with valid signal (velocity + edge)")
+        logger.info(f"TP: +{self._settings.tp_token_gain:.2f} | SL: -{self._settings.sl_token_loss:.2f} | TimeStop: {self._settings.time_stop_seconds:.0f}s")
         logger.info("Assets: BTC, ETH, SOL, XRP, MATIC, DOGE, LINK, AVAX")
-        logger.info(f"Dashboard: http://localhost:5000")
         logger.info("=" * 60)
 
         try:
@@ -151,12 +156,20 @@ class PolyBot:
 
         trade = await self._executor.execute(signal, window, risk_status)
         if trade is not None:
+            # Mark this window as traded + start asset cooldown
+            self._signal_engine.mark_traded(signal.asset, signal.window_ts)
+
             update_from_bot(
                 risk=self._risk,
                 settings=self._settings,
                 new_trade=trade,
                 running=True,
-                last_signal=f"{signal.asset} {signal.side} | delta={signal.btc_delta_pct:+.3f}% | edge={signal.edge_after_fees:.3f}",
+                last_signal=(
+                    f"{signal.asset} {signal.side} | "
+                    f"delta={signal.btc_delta_pct:+.3f}% | "
+                    f"edge={signal.edge_after_fees:.3f} | "
+                    f"conf={signal.confidence:.2f}"
+                ),
                 open_trades=self._get_open_trades_list(),
                 asset_prices=asset_prices,
             )
@@ -182,6 +195,9 @@ class PolyBot:
         logger.info("FINAL STATS")
         logger.info(f"Trades:    {stats['total_trades']}")
         logger.info(f"Win Rate:  {stats['win_rate']:.1%}")
+        logger.info(f"Avg Win:   ${stats['avg_win']:+.2f}")
+        logger.info(f"Avg Loss:  ${stats['avg_loss']:+.2f}")
+        logger.info(f"EV/Trade:  ${stats['expected_value']:+.4f}")
         logger.info(f"Total PnL: ${stats['total_pnl']:+.2f}")
         logger.info(f"Capital:   ${stats['current_capital']:.2f}")
         logger.info("=" * 60)

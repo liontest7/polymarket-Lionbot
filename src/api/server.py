@@ -39,7 +39,7 @@ class BotState:
         self.wins: int = 0
         self.losses: int = 0
         self.trades_today: int = 0
-        self.max_trades_today: int = 20
+        self.max_trades_today: int = 50
         self.fees_paid: float = 0.0
         self.peak_capital: float = 0.0
         self.trades: list[dict] = []
@@ -49,6 +49,10 @@ class BotState:
         self.last_update: float = time.time()
         self.log_messages: list[dict] = []
         self.asset_prices: dict = {}
+        self.avg_win: float = 0.0
+        self.avg_loss: float = 0.0
+        self.expected_value: float = 0.0
+        self.consecutive_losses: int = 0
 
     def add_log(self, level: str, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -81,6 +85,10 @@ class BotState:
             "last_update": self.last_update,
             "log_messages": self.log_messages[-80:],
             "asset_prices": self.asset_prices,
+            "avg_win": self.avg_win,
+            "avg_loss": self.avg_loss,
+            "expected_value": self.expected_value,
+            "consecutive_losses": self.consecutive_losses,
         }
 
 
@@ -222,7 +230,10 @@ async def save_settings(request: Request):
         allowed = {
             "TRADING_MODE", "CAPITAL_USD", "MAX_POSITION_PCT",
             "DAILY_LOSS_LIMIT_PCT", "MAX_TRADES_PER_DAY",
-            "MIN_BTC_DELTA_PCT", "MIN_EDGE_AFTER_FEES", "ENTRY_WINDOW_SECONDS",
+            "MIN_BTC_DELTA_PCT", "MIN_EDGE_AFTER_FEES",
+            "MIN_VELOCITY_PCT_PER_SEC", "MIN_SECONDS_REMAINING",
+            "COOLDOWN_SECONDS", "MAX_CONSECUTIVE_LOSSES",
+            "TP_TOKEN_GAIN", "SL_TOKEN_LOSS", "TIME_STOP_SECONDS",
             "TAKER_FEE_PCT", "MAKER_FEE_PCT", "LOG_LEVEL",
             "POLYMARKET_PK", "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET",
             "POLYMARKET_API_PASSPHRASE", "ALCHEMY_API_KEY"
@@ -382,6 +393,10 @@ def update_from_bot(
     bot_state.daily_pnl = daily.net_pnl
     bot_state.trades_today = daily.trades
     bot_state.max_trades_today = settings.max_trades_per_day
+    bot_state.avg_win = stats.get("avg_win", 0.0)
+    bot_state.avg_loss = stats.get("avg_loss", 0.0)
+    bot_state.expected_value = stats.get("expected_value", 0.0)
+    bot_state.consecutive_losses = stats.get("consecutive_losses", 0)
 
     if open_trades is not None:
         bot_state.open_trades = open_trades
