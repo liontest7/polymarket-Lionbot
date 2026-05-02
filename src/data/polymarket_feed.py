@@ -262,30 +262,49 @@ class MultiMarketFeed:
 
     async def _simulated_token_price(self, token_id: str) -> Optional[float]:
         """
-        Simulate a token price based on recent momentum.
-        Uses the token_id to determine which asset+side+window, then checks
-        the Binance delta to estimate where the market would be priced.
+        Simulate a token price that reflects the LAG between Binance and Polymarket.
+
+        Key insight: The market prices in the LONGER-TERM trend but NOT the very
+        recent short-term move. Our signal detects the recent move BEFORE the
+        market reprices — that is the edge we exploit.
+
+        So: token price = f(long-term trend) + window_noise
+                        ≠ f(recent 20s spike our signal detected)
+
+        This creates tokens in the 0.28–0.60 range where good risk/reward exists.
         """
         window_info = self._find_window_by_token(token_id)
         if window_info is None:
-            return 0.55
+            return 0.45
 
         asset, window, side = window_info
         if self._price_feed is None:
-            return 0.55
+            return 0.45
 
-        delta = self._price_feed.get_delta_pct(lookback_seconds=30.0, asset=asset)
-        if delta is None:
-            return 0.55
+        # Use LONG-TERM delta (120s) = what the market has already priced in
+        # The recent 20-30s spike is OUR edge — market hasn't caught up
+        delta_long = self._price_feed.get_delta_pct(lookback_seconds=120.0, asset=asset)
 
         base = 0.50
-        momentum = min(abs(delta) * 3.0, 0.15)
-        if (delta > 0 and side == "UP") or (delta < 0 and side == "DOWN"):
-            price = base + momentum
-        else:
-            price = base - momentum
 
-        return round(max(0.10, min(0.90, price)), 3)
+        if delta_long is not None:
+            # Market slowly prices in the 2-minute trend
+            consensus_move = min(abs(delta_long) * 1.2, 0.12)
+            if (delta_long > 0 and side == "UP") or (delta_long < 0 and side == "DOWN"):
+                base = 0.50 + consensus_move
+            else:
+                base = 0.50 - consensus_move
+
+        # Window-specific noise: each window starts with a different market bias
+        # This simulates natural variation in market maker pricing
+        import hashlib
+        seed_val = int(hashlib.md5(f"{asset}{window.window_ts}{side}".encode()).hexdigest()[:8], 16)
+        noise_range = 0.14
+        noise = (seed_val % 1000) / 1000.0 * noise_range - (noise_range / 2)
+        price = base + noise
+
+        # Realistic Polymarket price bounds (not too close to 0 or 1)
+        return round(max(0.10, min(0.78, price)), 3)
 
     def _find_window_by_token(self, token_id: str):
         for asset, window in self._windows.items():

@@ -71,11 +71,12 @@ class PolyBot:
     async def run(self) -> None:
         self._running = True
         logger.info("=" * 60)
-        logger.info("POLYMARKET MULTI-ASSET BOT  v4.1 PRO")
+        logger.info("POLYMARKET MULTI-ASSET BOT  v4.2 PRO")
         logger.info(f"Mode: {self._settings.trading_mode.upper()}")
-        logger.info(f"Capital: ${self._settings.capital_usd}")
-        logger.info(f"Entry: ANY TIME with valid signal (velocity + edge)")
-        logger.info(f"TP: +{self._settings.tp_token_gain:.2f} | SL: -{self._settings.sl_token_loss:.2f} | TimeStop: {self._settings.time_stop_seconds:.0f}s")
+        logger.info(f"Capital: ${self._settings.capital_usd} (dynamic compounding)")
+        logger.info(f"Token filter: {self._settings.min_token_price:.2f}–{self._settings.max_token_price:.2f} | Preferred ≤{self._settings.preferred_token_max:.2f}")
+        logger.info(f"Max open: {self._settings.max_open_trades} | Cooldown: {self._settings.cooldown_seconds:.0f}s")
+        logger.info(f"TP: +{self._settings.tp_token_gain:.2f} | SL: -{self._settings.sl_token_loss:.2f} (partial) | TimeStop: {self._settings.time_stop_seconds:.0f}s")
         logger.info("Assets: BTC, ETH, SOL, XRP, MATIC, DOGE, LINK, AVAX")
         logger.info("=" * 60)
 

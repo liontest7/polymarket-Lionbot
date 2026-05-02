@@ -1,11 +1,12 @@
 """
 src/execution/executor.py
-Trade execution — paper mode (simulation) and live mode (real orders).
+Trade execution — paper mode and live mode.
 
-Paper mode includes:
-  - TP/SL monitoring using live Binance price vs entry price
-  - Time stop: exit after N seconds if no resolution
-  - Smart resolution at window close
+Paper mode features:
+  - Real-time TP/SL monitoring using implied token price from Binance moves
+  - SL exits at PARTIAL recovery (not -100%) — realistic market exit
+  - Time stop near window close if no TP/SL triggered
+  - Full payout at settlement if held to window close
 """
 
 import asyncio
@@ -68,7 +69,6 @@ class PaperExecutor:
             ),
         )
 
-        # Record entry asset price for TP/SL tracking
         entry_asset_price = 0.0
         if self._binance:
             ap = self._binance.get_price(signal.asset)
@@ -78,19 +78,21 @@ class PaperExecutor:
         self._open_trades[trade_id] = trade
         self._risk.record_trade_open(trade)
 
+        payout_pct = (1.0 / signal.token_price - 1.0) * 100
         projected_win = round(shares * (1.0 - signal.token_price) - fee, 2)
-        projected_loss = round(-size_usd, 2)
+        projected_loss_sl = round(-size_usd * (self._settings.sl_token_loss / signal.token_price), 2)
 
         logger.success(
             f"[PAPER] {signal.asset} {signal.side} OPEN | "
-            f"id={trade_id} | ${size_usd:.2f} | {shares:.1f} shares | "
-            f"WIN:+${projected_win:.2f} LOSS:${projected_loss:.2f} | "
-            f"{window.seconds_remaining:.0f}s left in window"
+            f"${size_usd:.2f} @ {signal.token_price:.3f} | "
+            f"WIN: +${projected_win:.2f} (+{payout_pct:.0f}%) | "
+            f"SL: ~${projected_loss_sl:.2f} partial | "
+            f"{window.seconds_remaining:.0f}s left"
         )
 
         asyncio.create_task(
             self._monitor_trade(trade, window, entry_asset_price),
-            name=f"monitor-{trade_id}"
+            name=f"monitor-{trade_id}",
         )
         return trade
 
@@ -99,26 +101,25 @@ class PaperExecutor:
         if not trade:
             return False
 
-        open_price = 0.0
-        close_price = 0.0
+        open_price, close_price = 0.0, 0.0
         try:
             import httpx
             async with httpx.AsyncClient(timeout=5.0) as client:
                 symbol = trade.asset.upper() + "USDT"
                 entry_ms = int(trade.entry_time * 1000)
-                r_close = await client.get(
+                r = await client.get(
                     "https://api.binance.com/api/v3/ticker/price",
                     params={"symbol": symbol},
                 )
-                close_price = float(r_close.json()["price"])
-                r_kline = await client.get(
+                close_price = float(r.json()["price"])
+                r2 = await client.get(
                     "https://api.binance.com/api/v3/klines",
                     params={"symbol": symbol, "interval": "1m", "startTime": entry_ms, "limit": 1},
                 )
-                klines = r_kline.json()
+                klines = r2.json()
                 open_price = float(klines[0][1]) if klines else close_price
         except Exception as e:
-            logger.warning(f"Force resolve price fetch failed: {e}")
+            logger.warning(f"Force resolve fetch failed: {e}")
             open_price = close_price if close_price > 0 else 1.0
 
         window = PolyWindow(
@@ -130,23 +131,20 @@ class PaperExecutor:
             open_price=open_price,
             asset=trade.asset,
         )
-        if close_price > 0:
-            await self._resolve_with_prices(trade, window, open_price, close_price, reason="FORCE")
-        else:
-            await self._resolve_simulated(trade, window, reason="FORCE")
+        await self._settle_at_close(trade, window, close_price, open_price, reason="FORCE")
         return True
 
     async def _monitor_trade(self, trade: Trade, window: PolyWindow, entry_asset_price: float) -> None:
         """
-        Monitor open trade for TP/SL conditions and time stop.
-        Checks every 2 seconds.
+        Monitor every 2 seconds for TP/SL conditions.
+        Stays open until: TP hit, SL hit, time stop, or window close.
+        SL exits at PARTIAL recovery, not full loss.
         """
         check_interval = 2.0
-        time_stop = self._settings.time_stop_seconds
-        tp_gain = self._settings.tp_token_gain
-        sl_loss = self._settings.sl_token_loss
+        tp_gain = self._settings.tp_token_gain      # e.g. 0.20
+        sl_loss = self._settings.sl_token_loss       # e.g. 0.10
+        time_stop = self._settings.time_stop_seconds # e.g. 260s
         entry_token = trade.entry_price
-        start_time = trade.entry_time
 
         while True:
             await asyncio.sleep(check_interval)
@@ -155,67 +153,81 @@ class PaperExecutor:
                 return
 
             now = time.time()
-            secs_in_trade = now - start_time
+            secs_in_trade = now - trade.entry_time
             secs_to_close = window.close_ts - now
 
-            # ── Window closed → resolve at settlement ─────────────────────
+            # Window has closed → settle at final price
             if secs_to_close <= 0:
-                await self._resolve_simulated(trade, window, reason="WINDOW_CLOSE")
+                await self._resolve_at_settlement(trade, window, reason="WINDOW_CLOSE")
                 return
 
-            # ── TP / SL via token price simulation ───────────────────────
-            if self._binance:
+            # ── TP / SL via implied token price ──────────────────────────
+            if self._binance and entry_asset_price > 0:
                 ap = self._binance.get_price(trade.asset)
-                if ap and entry_asset_price > 0:
+                if ap:
                     price_move_pct = (ap.price - entry_asset_price) / entry_asset_price
 
-                    # Estimate current token price based on Binance move
+                    # Implied token price based on Binance move
+                    # UP bet: token rises when price rises
+                    # DOWN bet: token rises when price falls
                     if trade.side == "UP":
-                        implied_token = entry_token + price_move_pct * 0.8
+                        implied_token = entry_token + price_move_pct * 0.85
                     else:
-                        implied_token = entry_token - price_move_pct * 0.8
+                        implied_token = entry_token - price_move_pct * 0.85
 
                     implied_token = max(0.02, min(0.98, implied_token))
-                    token_gain = implied_token - entry_token if trade.side == "UP" else entry_token - implied_token
+                    token_change = implied_token - entry_token
 
-                    # Take Profit
-                    if token_gain >= tp_gain:
-                        pnl = round(trade.shares * token_gain - trade.fees_paid, 4)
+                    # Positive change = good for us (our direction winning)
+                    our_gain = token_change if trade.side == "UP" else -token_change
+
+                    # ── Take Profit ─────────────────────────────────────
+                    if our_gain >= tp_gain:
+                        exit_token = min(0.96, entry_token + our_gain)
+                        pnl = round(trade.shares * (exit_token - entry_token) - trade.fees_paid, 4)
                         trade.result = "WIN"
-                        trade.exit_price = implied_token
+                        trade.exit_price = exit_token
                         trade.pnl_usd = pnl
                         trade.exit_time = now
+                        payout_pct = pnl / trade.size_usd * 100
                         logger.success(
                             f"[TP] {trade.asset} {trade.side} | "
-                            f"token {entry_token:.3f}→{implied_token:.3f} (+{token_gain:.3f}) | "
-                            f"pnl=+${pnl:.2f}"
+                            f"token {entry_token:.3f}→{exit_token:.3f} | "
+                            f"pnl=+${pnl:.2f} (+{payout_pct:.0f}%)"
                         )
                         await self._close_trade(trade)
                         return
 
-                    # Stop Loss
-                    if token_gain <= -sl_loss:
-                        pnl = round(-trade.size_usd * 0.6, 4)
+                    # ── Stop Loss — PARTIAL RECOVERY ─────────────────────
+                    # We exit at implied_token price, NOT at zero
+                    # Recovery = shares × exit_token_price
+                    if our_gain <= -sl_loss:
+                        exit_token = max(0.02, implied_token)
+                        recovery = trade.shares * exit_token
+                        pnl = round(recovery - trade.size_usd - trade.fees_paid, 4)
                         trade.result = "LOSS"
-                        trade.exit_price = implied_token
+                        trade.exit_price = exit_token
                         trade.pnl_usd = pnl
                         trade.exit_time = now
+                        loss_pct = abs(pnl) / trade.size_usd * 100
                         logger.warning(
                             f"[SL] {trade.asset} {trade.side} | "
-                            f"token {entry_token:.3f}→{implied_token:.3f} ({token_gain:.3f}) | "
-                            f"pnl=${pnl:.2f}"
+                            f"token {entry_token:.3f}→{exit_token:.3f} (partial exit) | "
+                            f"pnl=${pnl:.2f} (-{loss_pct:.0f}% — saved ${recovery:.2f})"
                         )
                         await self._close_trade(trade)
                         return
 
-            # ── Time Stop ────────────────────────────────────────────────
+            # ── Time Stop — settle at current window state ────────────────
             if secs_in_trade >= time_stop:
-                # At time stop: resolve based on actual price movement
-                logger.info(f"[TIME_STOP] {trade.asset} {trade.id} — {secs_in_trade:.0f}s elapsed")
-                await self._resolve_simulated(trade, window, reason="TIME_STOP")
+                logger.info(
+                    f"[TIME_STOP] {trade.asset} {trade.id} — {secs_in_trade:.0f}s elapsed, "
+                    f"settling at window state"
+                )
+                await self._resolve_at_settlement(trade, window, reason="TIME_STOP")
                 return
 
-    async def _resolve_simulated(self, trade: Trade, window: PolyWindow, reason: str = "WINDOW_CLOSE") -> None:
+    async def _resolve_at_settlement(self, trade: Trade, window: PolyWindow, reason: str = "SETTLE") -> None:
         if trade.id not in self._open_trades:
             return
 
@@ -223,54 +235,58 @@ class PaperExecutor:
         close_price = 0.0
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                symbol = trade.asset.upper() + "USDT"
                 resp = await client.get(
                     "https://api.binance.com/api/v3/ticker/price",
-                    params={"symbol": symbol},
+                    params={"symbol": trade.asset.upper() + "USDT"},
                 )
                 close_price = float(resp.json()["price"])
         except Exception as e:
-            logger.warning(f"Could not fetch close price for {trade.asset}: {e}")
+            logger.warning(f"Settlement price fetch failed for {trade.asset}: {e}")
 
-        open_price = window.open_price
-        await self._resolve_with_prices(trade, window, open_price, close_price, reason=reason)
+        await self._settle_at_close(trade, window, close_price, window.open_price, reason=reason)
 
-    async def _resolve_with_prices(
+    async def _settle_at_close(
         self,
         trade: Trade,
         window: PolyWindow,
-        open_price: float,
         close_price: float,
+        open_price: float,
         reason: str = "SETTLE",
     ) -> None:
         if trade.id not in self._open_trades:
             return
 
-        if open_price <= 0 or close_price <= 0:
-            # Fallback: coin flip weighted by signal
-            import random
-            trade_won = random.random() < trade.entry_price + 0.05
-        else:
+        if trade.result in ("WIN", "LOSS"):
+            # Already resolved by TP/SL — just close
+            await self._close_trade(trade)
+            return
+
+        if open_price > 0 and close_price > 0:
             went_up = close_price >= open_price
             trade_won = (went_up and trade.side == "UP") or (not went_up and trade.side == "DOWN")
+        else:
+            import random
+            trade_won = random.random() < (trade.entry_price + 0.05)
 
-        if trade.result not in ("WIN", "LOSS"):
-            trade.result = "WIN" if trade_won else "LOSS"
-            trade.exit_price = 1.0 if trade_won else 0.0
-            if trade.result == "WIN":
-                trade.pnl_usd = round(trade.shares * (1.0 - trade.entry_price) - trade.fees_paid, 4)
-            else:
-                trade.pnl_usd = round(-trade.size_usd, 4)
-
-        delta_pct = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
-        icon = "✓ WIN" if trade.result == "WIN" else "✗ LOSS"
-        logger.info(
-            f"[{reason}] {icon} | {trade.asset} {trade.side} | "
-            f"open=${open_price:.4f} close=${close_price:.4f} Δ={delta_pct:+.3f}% | "
-            f"pnl=${trade.pnl_usd:+.2f}"
-        )
+        if trade_won:
+            trade.result = "WIN"
+            trade.exit_price = 1.0
+            # Full settlement payout: shares × (1 - entry_price)
+            trade.pnl_usd = round(trade.shares * (1.0 - trade.entry_price) - trade.fees_paid, 4)
+        else:
+            trade.result = "LOSS"
+            trade.exit_price = 0.0
+            # At settlement — token goes to 0, full loss
+            trade.pnl_usd = round(-trade.size_usd, 4)
 
         trade.exit_time = time.time()
+        delta_pct = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
+        icon = "✓ WIN" if trade.result == "WIN" else "✗ LOSS"
+        payout_pct = trade.pnl_usd / trade.size_usd * 100 if trade.size_usd > 0 else 0
+        logger.info(
+            f"[{reason}] {icon} | {trade.asset} {trade.side} | "
+            f"Δ={delta_pct:+.3f}% | pnl=${trade.pnl_usd:+.2f} ({payout_pct:+.0f}%)"
+        )
         await self._close_trade(trade)
 
     async def _close_trade(self, trade: Trade) -> None:
@@ -333,10 +349,12 @@ class LiveExecutor:
         limit_price = round(signal.token_price, 2)
         shares = round(risk_status.suggested_shares, 0)
         size_usd = shares * limit_price
+        payout_pct = (1.0 / limit_price - 1.0) * 100
 
         logger.warning(
-            f"[LIVE] {signal.asset} {signal.side} | shares={shares} | "
-            f"price={limit_price} | ${size_usd:.2f}"
+            f"[LIVE] {signal.asset} {signal.side} | "
+            f"shares={shares} @ {limit_price} | ${size_usd:.2f} | "
+            f"WIN would pay +{payout_pct:.0f}%"
         )
 
         try:
