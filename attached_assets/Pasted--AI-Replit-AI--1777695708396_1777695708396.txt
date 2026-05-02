@@ -1,0 +1,136 @@
+סגור — הנה סיכום מסודר, ברור ויישומי שאתה יכול לשלוח ל-AI (כמו Replit AI) כדי לשפר/לבנות את הבוט שלך למסחר ב־Polymarket.
+
+שמתי דגש על דברים שבאמת עושים הבדל ברווחיות — לא תיאוריה.
+
+🧠 🎯 מטרה
+
+לבנות בוט מסחר קצר טווח (שניות–דקות) עם:
+
+edge אמיתי
+ניהול סיכון נכון
+ביצוע יעיל
+יכולת סקייל (להגדיל סכומים)
+⚙️ 1. SIGNAL ENGINE (הלב של הבוט)
+❗ חובה להוסיף:
+✔️ A. Price Velocity (מהירות תנועה)
+לחשב שינוי מחיר חלקי זמן
+להיכנס רק אם יש תנועה חזקה
+velocity = (price_now - price_prev) / time_delta
+✔️ B. Expected Move (תנודתיות)
+לחשב כמה הנכס זז בממוצע ב־5 דקות
+לא להיכנס אם אין מספיק תנועה צפויה
+✔️ C. זיהוי Mispricing מול שוק חיצוני (Binance וכו’)
+להשוות מחיר אמיתי vs הסתברות ב־Polymarket
+לזהות מתי השוק “מאחר” או טועה
+✔️ D. סינון שוק מת (CRITICAL)
+
+לא להיכנס אם:
+
+spread גבוה
+נזילות נמוכה
+אין תנועה
+✔️ תנאי כניסה סופי:
+if (
+    velocity > threshold
+    and spread < max_spread
+    and liquidity > min_liquidity
+    and expected_move > min_move
+):
+    enter_trade()
+⚠️ 2. RISK MANAGEMENT (מה ששומר עליך בחיים)
+✔️ A. סיכון קבוע לעסקה
+1%–2% מההון בלבד
+✔️ B. TP / SL עם יחס נכון
+מינימום 1:2
+
+לדוגמה:
+
+SL: -0.04
+TP: +0.08
+🔥 C. Time Stop (חובה!)
+יציאה אוטומטית אם לא זז
+if time_in_trade > 120 seconds:
+    exit_trade()
+✔️ D. Dynamic Position Size
+להגדיל פוזיציה רק אם הסיגנל חזק
+✔️ E. Max Exposure
+לא יותר מפוזיציה אחת / או הגבלה ברורה
+❌ לא להשתמש:
+מרטינגייל (הכפלת הפסדים)
+“להתפלל שהשוק יחזור”
+⚡ 3. EXECUTION (פה הולך הכסף בפועל)
+✔️ לעבוד עם LIMIT ORDERS בלבד
+לא MARKET
+✔️ בדיקת Order Book
+
+לפני כניסה:
+
+if orderbook_depth < threshold:
+    skip_trade()
+✔️ ניהול יציאה חכם
+
+לא רק TP/SL:
+
+if momentum_weakens:
+    exit_early()
+✔️ מניעת Slippage
+לא להיכנס אם spread גדול
+לא להיכנס לשוק ריק
+📊 4. DATA & METRICS (בלי זה אתה עיוור)
+חובה לוגים:
+win rate
+avg win
+avg loss
+זמן החזקה
+slippage
+drawdown
+✔️ חישוב ביצועים:
+EV = (win_rate * avg_win) - (loss_rate * avg_loss)
+🔁 5. STRATEGY LOGIC (איך הבוט באמת מרוויח)
+לבחור לפחות אחת:
+✔️ Scalping
+רווח קטן ומהיר
+הרבה עסקאות
+✔️ Mean Reversion
+כניסה אחרי תנועה חדה מדי
+✔️ Momentum
+להצטרף לתנועה חזקה ולצאת מהר
+❗ חשוב:
+
+לא לסחור “כיוון” בלבד
+אלא לנצל חוסר יעילות (inefficiency)
+
+📈 6. SCALING (להגדיל רווחים נכון)
+✔️ להגדיל פוזיציה רק כשיש רווח:
+לפי גידול הון
+position_size = base_size * (equity / initial_equity)
+❌ לא:
+להכפיל אחרי הפסד
+🛑 7. הגנות קריטיות לבוט
+✔️ Stop Bot אם:
+drawdown > 10%
+X הפסדים רצופים
+✔️ הגבלת טריידים:
+cooldown בין עסקאות
+✔️ בדיקות:
+לא להיכנס קרוב לסיום חוזה (5 דקות)
+🧠 8. שדרוג מתקדם (EDGE אמיתי)
+✔️ לזהות Lag בין שווקים
+Binance זז → Polymarket מגיב באיחור
+✔️ לנצל Order Flow
+לראות מי לוחץ את המחיר
+✔️ לעבוד כמו Market Maker (מתקדם)
+לקנות בזול, למכור ביוקר
+לא רק לנחש כיוון
+🧩 סיכום קצר לשליחה ל-AI:
+
+👉 לבנות בוט עם:
+
+Signal מבוסס velocity + volatility + liquidity
+Risk management עם TP/SL + Time Stop
+Execution עם limit orders בלבד
+סינון שווקים לא נזילים
+לוגים מלאים ומדידת ביצועים
+אסטרטגיה: scalping / momentum / mean reversion
+ניהול גודל פוזיציה חכם
+מנגנוני הגנה (drawdown, הפסדים רצופים)
